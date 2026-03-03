@@ -1,0 +1,201 @@
+{
+  "name": "Slack AI Data Bot (Groq)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "slack-ask-data",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-node",
+      "name": "Slack Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Receives /ask-data slash command from Slack. Set this webhook URL in your Slack App Slash Commands config."
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "ack-node",
+      "name": "Immediate ACK (200)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [460, 160],
+      "notes": "Slack requires a 200 response within 3 seconds. We ack immediately and send the real result via response_url later."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the user's question and metadata from the Slack slash command payload\nconst body = $input.first().json.body;\nconst params = new URLSearchParams(body);\n\nconst question = params.get('text') || '';\n\nif (!question.trim()) {\n  throw new Error('No question provided. Usage: /ask-data <your question>');\n}\n\nreturn [{\n  json: {\n    question: question.trim(),\n    channel_id: params.get('channel_id') || '',\n    user_id: params.get('user_id') || '',\n    response_url: params.get('response_url') || ''\n  }\n}];"
+      },
+      "id": "parse-node",
+      "name": "Parse Slack Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"model\": \"llama-3.1-8b-instant\",\n  \"temperature\": 0,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a PostgreSQL expert. Convert the user's natural language question into a single valid PostgreSQL SELECT statement.\\n\\nTable: public.sales_daily\\nColumns:\\n  - date (DATE): the calendar date\\n  - region (TEXT): sales region - North, South, East, West\\n  - category (TEXT): product category - Electronics, Grocery, Fashion\\n  - revenue (NUMERIC): total revenue in USD\\n  - orders (INTEGER): number of orders\\n  - created_at (TIMESTAMPTZ): row creation timestamp\\n\\nRules:\\n- Output ONLY the raw SQL query - no markdown fences, no explanations, no comments.\\n- Always use the fully qualified table name: public.sales_daily\\n- Only produce SELECT or WITH (CTE) statements. Never INSERT, UPDATE, DELETE, DROP.\\n- Use clear column aliases when aggregating (e.g. SUM(revenue) AS total_revenue).\\n- Add ORDER BY for readability when listing multiple rows.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"={{ $json.question }}\"\n    }\n  ]\n}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "groq-node",
+      "name": "Generate SQL (Groq)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 340],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "groq-header-cred",
+          "name": "Groq API Key"
+        }
+      },
+      "notes": "Calls Groq API using OpenAI-compatible endpoint. Credential must be Header Auth with Name=Authorization, Value=Bearer gsk_..."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract SQL from Groq response and validate it\nconst groqResponse = $input.first().json;\n\n// Get the generated text from Groq OpenAI-compatible response\nlet sql = groqResponse?.choices?.[0]?.message?.content || '';\n\nif (!sql) {\n  throw new Error('Groq returned an empty response. Please try again.');\n}\n\n// Strip markdown code fences if model added them despite instructions\nsql = sql.replace(/```sql/gi, '').replace(/```/g, '').trim();\n\n// Safety check - only allow SELECT or WITH (CTE) statements\nconst firstToken = sql.split(/\\s+/)[0].toUpperCase();\nif (!['SELECT', 'WITH'].includes(firstToken)) {\n  throw new Error(`Unsafe SQL blocked. Only SELECT queries are allowed. Model returned: ${firstToken}`);\n}\n\n// Pass SQL and original Slack metadata downstream\nreturn [{\n  json: {\n    sql,\n    question: $node['Parse Slack Payload'].json.question,\n    channel_id: $node['Parse Slack Payload'].json.channel_id,\n    user_id: $node['Parse Slack Payload'].json.user_id,\n    response_url: $node['Parse Slack Payload'].json.response_url\n  }\n}];"
+      },
+      "id": "clean-sql-node",
+      "name": "Clean & Validate SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 340]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      },
+      "id": "postgres-node",
+      "name": "Execute on Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1180, 340],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-creds",
+          "name": "analytics DB"
+        }
+      },
+      "notes": "Runs the generated SQL against Postgres. Configure 'analytics DB' credential with your Neon or local DB connection details."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format query results into a readable Slack message\nconst results = $input.all().map(item => item.json);\nconst sql = $node['Clean & Validate SQL'].json.sql;\nconst question = $node['Clean & Validate SQL'].json.question;\nconst response_url = $node['Clean & Validate SQL'].json.response_url;\n\n// Empty result set\nif (!results || results.length === 0) {\n  return [{\n    json: {\n      message: `*📊 Query Results*\\n\\n*Question:* ${question}\\n*Rows:* 0\\n\\n*SQL Used:*\\n\\`\\`\\`${sql}\\`\\`\\`\\n\\nℹ️ No rows matched your query.`,\n      response_url\n    }\n  }];\n}\n\n// Build a fixed-width ASCII table (max 10 rows preview)\nconst headers = Object.keys(results[0]);\nconst maxPreview = 10;\nconst preview = results.slice(0, maxPreview);\n\n// Calculate column widths (capped at 25 chars)\nconst widths = headers.map(h =>\n  Math.min(25, Math.max(h.length, ...preview.map(r => String(r[h] ?? 'NULL').length)))\n);\n\nconst truncate = (val, w) => {\n  const s = String(val ?? 'NULL');\n  return s.length > w ? s.slice(0, w - 1) + '...' : s;\n};\n\nconst fmtRow = vals =>\n  vals.map((v, i) => truncate(v, widths[i]).padEnd(widths[i])).join(' | ');\n\nconst separator = widths.map(w => '-'.repeat(w)).join('-+-');\n\nconst lines = [\n  fmtRow(headers),\n  separator,\n  ...preview.map(r => fmtRow(headers.map(h => r[h])))\n];\n\nif (results.length > maxPreview) {\n  lines.push(`... ${results.length - maxPreview} more rows not shown`);\n}\n\nconst table = lines.join('\\n');\n\nconst message = [\n  `*📊 Query Results*`,\n  `*Question:* ${question}`,\n  `*Rows Returned:* ${results.length}`,\n  ``,\n  `*Generated SQL:*`,\n  `\\`\\`\\`${sql}\\`\\`\\``,\n  ``,\n  `*Preview:*`,\n  `\\`\\`\\`${table}\\`\\`\\``\n].join('\\n');\n\nreturn [{ json: { message, response_url } }];"
+      },
+      "id": "format-node",
+      "name": "Format Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1420, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.response_url }}",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"response_type\": \"in_channel\",\n  \"text\": {{ JSON.stringify($json.message) }}\n}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "slack-respond-node",
+      "name": "Send to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1660, 340],
+      "notes": "Posts the formatted result back to Slack using the response_url from the original slash command."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a clean error message and send it back to Slack\nconst error = $input.first().json?.error?.message\n           || $input.first().json?.message\n           || JSON.stringify($input.first().json)\n           || 'Unknown error';\n\n// Try to get response_url from whichever upstream node has it\nconst response_url =\n  $node['Clean & Validate SQL']?.json?.response_url ||\n  $node['Parse Slack Payload']?.json?.response_url ||\n  '';\n\nreturn [{\n  json: {\n    message: `❌ *Query Failed*\\n\\n*Error:*\\n\\`\\`\\`${error}\\`\\`\\`\\n\\n💡 Try rephrasing your question or check your column names.`,\n    response_url\n  }\n}];"
+      },
+      "id": "error-node",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 540],
+      "notes": "Catches errors from any node and sends a friendly error message back to Slack."
+    }
+  ],
+  "connections": {
+    "Slack Webhook": {
+      "main": [
+        [
+          { "node": "Immediate ACK (200)", "type": "main", "index": 0 },
+          { "node": "Parse Slack Payload", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Parse Slack Payload": {
+      "main": [
+        [{ "node": "Generate SQL (Groq)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Generate SQL (Groq)": {
+      "main": [
+        [{ "node": "Clean & Validate SQL", "type": "main", "index": 0 }]
+      ],
+      "error": [
+        [{ "node": "Handle Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Clean & Validate SQL": {
+      "main": [
+        [{ "node": "Execute on Postgres", "type": "main", "index": 0 }]
+      ],
+      "error": [
+        [{ "node": "Handle Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Execute on Postgres": {
+      "main": [
+        [{ "node": "Format Results", "type": "main", "index": 0 }]
+      ],
+      "error": [
+        [{ "node": "Handle Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Results": {
+      "main": [
+        [{ "node": "Send to Slack", "type": "main", "index": 0 }]
+      ]
+    },
+    "Handle Error": {
+      "main": [
+        [{ "node": "Send to Slack", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  }
+}
